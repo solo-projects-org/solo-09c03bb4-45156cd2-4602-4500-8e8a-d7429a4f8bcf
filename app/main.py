@@ -40,10 +40,18 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
+from app.matching import (
+    crossmatch,
+    parse_candidates,
+    parse_sources,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 WORKER_PY = APP_DIR / "worker.py"
 INDEX_HTML = APP_DIR / "static" / "index.html"
 SAMPLE_CSV = APP_DIR.parent / "sample" / "sample_star.csv"
+SAMPLE_CANDIDATE_CSV = APP_DIR.parent / "sample" / "candidates_sample.csv"
+SAMPLE_CATALOG_CSV = APP_DIR.parent / "sample" / "catalog_sample.csv"
 
 N_FREQ = 10_000          # 频率网格点数
 N_PERM = 200             # 置换检验次数
@@ -448,3 +456,66 @@ async def job_plot(job_id: str, kind: str) -> Response:
     if key is None:
         raise HTTPException(404, "未知图类型")
     return Response(content=job.result[key], media_type="image/png")
+
+
+# --------------------------------------------------------------------------- #
+# 星表交叉证认
+# --------------------------------------------------------------------------- #
+
+@app.get("/api/sample_candidates.csv")
+async def sample_candidates_csv() -> FileResponse:
+    if not SAMPLE_CANDIDATE_CSV.exists():
+        raise HTTPException(404, "候选样例文件不存在")
+    return FileResponse(SAMPLE_CANDIDATE_CSV, media_type="text/csv",
+                        filename="candidates_sample.csv")
+
+
+@app.get("/api/sample_catalog.csv")
+async def sample_catalog_csv() -> FileResponse:
+    if not SAMPLE_CATALOG_CSV.exists():
+        raise HTTPException(404, "星表样例文件不存在")
+    return FileResponse(SAMPLE_CATALOG_CSV, media_type="text/csv",
+                        filename="catalog_sample.csv")
+
+
+@app.post("/api/crossmatch")
+async def create_crossmatch(
+    candidate_file: UploadFile = File(...),
+    catalog_file: UploadFile = File(...),
+    max_sep_arcsec: float = Form(...),
+) -> dict:
+    """上传候选与星表 CSV,做一对一最优交叉证认。
+
+    候选中的每个 job_id 必须指向当前内存中已完成(成功)的批次,
+    结果中携带该批的最高峰周期。
+    """
+    if not (math.isfinite(max_sep_arcsec) and max_sep_arcsec > 0.0):
+        raise HTTPException(400, "最大角距必须为正数(角秒)")
+
+    raw_cand = await candidate_file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_cand) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "候选文件过大")
+    raw_cat = await catalog_file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_cat) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "星表文件过大")
+
+    candidates = parse_candidates(raw_cand)
+    sources = parse_sources(raw_cat)
+
+    # job_id 必须指向当前已完成批次;失败/取消/运行中/不存在一律拒绝
+    periods: dict[str, float] = {}
+    bad: list[str] = []
+    for c in candidates:
+        job = JOBS.get(c["job_id"])
+        if job is None or job.state != "done" or not job.result:
+            bad.append(f"{c['candidate_id']}→{c['job_id']}")
+        else:
+            periods[c["job_id"]] = float(job.result["best_period"])
+    if bad:
+        raise HTTPException(
+            409,
+            "以下候选的 job_id 未指向当前已完成批次(批次可能不存在、"
+            f"仍在计算或已失败/取消):{', '.join(bad)}。"
+            "请先在上方提交测光批处理并等待成功。")
+
+    return crossmatch(candidates, sources, max_sep_arcsec, periods=periods)

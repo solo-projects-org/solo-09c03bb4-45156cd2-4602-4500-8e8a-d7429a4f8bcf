@@ -1,0 +1,6 @@
+candidate_id,job_id,ra_deg,dec_deg
+C1,JOB_A,-0.0000318,89.5
+C2,JOB_A2,0.0000318,89.5
+C3,JOB_B,120,-29.9997222
+C4,JOB_B2,120,-30.0002778
+C5,JOB_C,240,10

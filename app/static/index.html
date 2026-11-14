@@ -55,6 +55,16 @@
             border-radius:8px; padding:10px 14px; font-size:13px;
             white-space:pre-wrap; }
   .row-actions button { margin-right:6px; padding:5px 10px; font-size:12px; }
+  .st-review    { background:#b9770e; }
+  .st-matched   { background:var(--green); }
+  .st-unmatched { background:#5d6d7e; }
+  .subtable { margin:6px 0 0; }
+  .subtable td { padding:4px 10px; font-size:12px; }
+  .tag-no { color:var(--red); font-weight:600; }
+  .tag-yes { color:var(--green); font-weight:600; }
+  #xmMsg { margin-top:10px; font-size:13px; min-height:18px; }
+  #xmMsg.err { color:var(--red); } #xmMsg.ok { color:var(--green); }
+  .period-cell { font-family:ui-monospace,Consolas,monospace; }
 </style>
 </head>
 <body>
@@ -101,6 +111,32 @@
   <section class="card" id="detailCard" hidden>
     <h2>批处理详情 <span class="mono" id="dId"></span></h2>
     <div id="dBody"></div>
+  </section>
+
+  <section class="card">
+    <h2>星表关联(交叉证认)</h2>
+    <form id="xmForm">
+      <label>候选 CSV(candidate_id、job_id、ra_deg、dec_deg,≤20 行)
+        <input type="file" name="candidate_file" accept=".csv,text/csv" required>
+      </label>
+      <label>星表 CSV(source_id、ra_deg、dec_deg,≤50 行)
+        <input type="file" name="catalog_file" accept=".csv,text/csv" required>
+      </label>
+      <label>最大角距(角秒,正数)
+        <input type="number" name="max_sep_arcsec" step="any" min="0"
+               value="1.5" required>
+      </label>
+      <button type="submit">开始关联</button>
+      <button type="button" class="secondary" id="xmDemoBtn">载入关联样例并演示</button>
+    </form>
+    <div id="xmMsg"></div>
+    <p class="hint">候选的 job_id 必须指向当前<strong>已完成</strong>的测光批次,
+       结果会带上该批最高峰周期。按球面大圆距离匹配(正确处理赤经跨 0°);
+       每颗候选与每个星表源最多使用一次,先最大化匹配数,再最小化总角距,
+       角距四舍五入到 0.001 角秒后比较。存在多个同等最优分配时,受影响候选
+       会列出全部可选源及未匹配可能并标为「待复核」,不任意认定。
+       演示按钮会自动提交并等待 5 批样例测光任务,再替换样例里的 job_id 占位符。</p>
+    <div id="xmResult"></div>
   </section>
 </main>
 
@@ -259,6 +295,182 @@ async function renderDetail() {
 
 refresh();
 setInterval(refresh, 2000);
+
+// ========================================================================= //
+// 星表关联(交叉证认)
+// ========================================================================= //
+const XM_STATUS = { review: "待复核", matched: "已匹配", unmatched: "未匹配" };
+let xmBusy = false;
+
+function xmShow(text, ok) {
+  const m = $("xmMsg");
+  m.textContent = text;
+  m.className = ok ? "ok" : "err";
+}
+
+function fmtSep(v) { return Number(v).toFixed(3) + " \""; }
+function fmtPeriod(v) { return v == null ? "—" : Number(v).toPrecision(7) + " 天"; }
+
+$("xmForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (xmBusy) return;
+  xmBusy = true;
+  try {
+    const fd = new FormData(ev.target);
+    const resp = await fetch("/api/crossmatch", { method: "POST", body: fd });
+    const j = await resp.json();
+    if (!resp.ok) { xmShow("关联失败:" + (j.detail || resp.status), false); return; }
+    xmShow("关联完成", true);
+    renderCrossmatch(j);
+  } catch (e) {
+    xmShow("关联请求失败:" + e, false);
+  } finally { xmBusy = false; }
+});
+
+function renderCrossmatch(j) {
+  const s = j.summary;
+  let html =
+    `<p class="hint">阈值 ${j.max_sep_arcsec} 角秒 · 候选 ${s.n_candidates} 颗 · ` +
+    `星表源 ${s.n_sources} 个 · 最优匹配 <strong>${s.optimal_matches}</strong> 对 · ` +
+    `最小总角距 <strong>${Number(s.min_total_sep_arcsec).toFixed(3)}"</strong> · ` +
+    `待复核 ${s.n_review} · 已匹配 ${s.n_matched} · 未匹配 ${s.n_unmatched}</p>` +
+    `<table><thead><tr>` +
+    `<th>候选</th><th>job_id</th><th>最高峰周期</th><th>状态</th>` +
+    `<th>匹配源 / 可选结局(角距)</th></tr></thead><tbody>`;
+  for (const c of j.candidates) {
+    let cell;
+    if (c.status === "matched") {
+      cell = `${esc(c.match.source_id)} · ${fmtSep(c.match.separation_arcsec)}`;
+    } else if (c.status === "unmatched") {
+      cell = '<span class="tag-no">无阈值内可行匹配</span>';
+    } else {
+      const rows = c.options.map((o) => {
+        const tag = o.feasible
+          ? '<span class="tag-yes">属于最优分配</span>'
+          : '<span class="tag-no">不属于最优分配</span>';
+        const body = o.kind === "source"
+          ? `${esc(o.source_id)} · ${fmtSep(o.separation_arcsec)}`
+          : "<strong>未匹配</strong>";
+        return `<tr><td>${body}</td><td>${tag}</td></tr>`;
+      }).join("");
+      cell = `<table class="subtable"><tbody>${rows}</tbody></table>`;
+    }
+    html +=
+      `<tr><td class="mono">${esc(c.candidate_id)}</td>` +
+      `<td class="mono">${esc(c.job_id)}</td>` +
+      `<td class="period-cell">${fmtPeriod(c.best_period_day)}</td>` +
+      `<td><span class="badge st-${c.status}">${XM_STATUS[c.status]}</span></td>` +
+      `<td>${cell}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  if (j.unmatched_sources.length) {
+    html += `<p class="hint">确定未被任何最优分配使用的星表源:` +
+      j.unmatched_sources.map(esc).join("、") + "</p>";
+  }
+  $("xmResult").innerHTML = html;
+}
+
+async function getJson(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+  return j;
+}
+
+async function submitSampleJob() {
+  const r = await fetch("/api/sample.csv");
+  if (!r.ok) throw new Error("样例测光数据获取失败");
+  const blob = await r.blob();
+  const fd = new FormData();
+  fd.append("file", new File([blob], "sample_star.csv", { type: "text/csv" }));
+  fd.append("period_min", "2");
+  fd.append("period_max", "10");
+  const j = await getJson("/api/jobs", { method: "POST", body: fd });
+  return j.job_id;
+}
+
+async function ensureDoneJobs(needed) {
+  // needed: 占位符 → 真实批号(可能已由前次演示创建)
+  let guard = 0;
+  while (guard++ < 300) {   // 最长约 10 分钟
+    const list = (await getJson("/api/jobs")).jobs;
+    const byId = Object.fromEntries(list.map((x) => [x.job_id, x]));
+    const pending = [];
+    for (const [ph, id] of Object.entries(needed)) {
+      const st = byId[id]?.state;
+      if (st === "done") continue;
+      if (st === "failed" || st === "cancelled") throw new Error(`批次 ${id} 已${st}`);
+      pending.push(ph);
+    }
+    if (!pending.length) return;
+    xmShow(`等待样例批次完成(${pending.join("、")}),请稍候……`, true);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("等待批次完成超时");
+}
+
+$("xmDemoBtn").addEventListener("click", async () => {
+  if (xmBusy) return;
+  xmBusy = true;
+  try {
+    const [candCsv, catCsv, jobsJson] = await Promise.all([
+      fetch("/api/sample_candidates.csv").then((r) => {
+        if (!r.ok) throw new Error("候选样例获取失败"); return r.text();
+      }),
+      fetch("/api/sample_catalog.csv").then((r) => {
+        if (!r.ok) throw new Error("星表样例获取失败"); return r.text();
+      }),
+      getJson("/api/jobs"),
+    ]);
+    const placeholders = [...new Set(
+      candCsv.split("\n").slice(1).filter(Boolean).map((l) => l.split(",")[1]))];
+
+    // 复用已成功的样例批次(按文件名识别),不足则补提;受两批并行限制,
+    // 429 时等待后重试。
+    const doneSample = jobsJson.jobs
+      .filter((j) => j.state === "done" && j.filename === "sample_star.csv")
+      .map((j) => j.job_id);
+    const mapping = {};
+    let reuse = 0;
+    for (const ph of placeholders) {
+      if (reuse < doneSample.length) mapping[ph] = doneSample[reuse++];
+    }
+    for (const ph of placeholders.filter((p) => !(p in mapping))) {
+      let created = false;
+      for (let attempt = 0; attempt < 60 && !created; attempt++) {
+        try {
+          mapping[ph] = await submitSampleJob();
+          created = true;
+        } catch (e) {
+          if (!String(e.message).includes("429")) throw e;
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+      }
+      if (!created) throw new Error("并行名额长期占用,演示启动失败");
+      xmShow(`已提交样例批次 ${mapping[ph]}(占位符 ${ph})`, true);
+    }
+    await ensureDoneJobs(mapping);
+
+    let replaced = candCsv;
+    // 长占位符先替换,避免 JOB_A 误伤 JOB_A2 这类前缀
+    for (const ph of Object.keys(mapping).sort((a, b) => b.length - a.length)) {
+      replaced = replaced.replaceAll(ph, mapping[ph]);
+    }
+    const fd = new FormData();
+    fd.append("candidate_file",
+      new File([replaced], "candidates_sample.csv", { type: "text/csv" }));
+    fd.append("catalog_file",
+      new File([catCsv], "catalog_sample.csv", { type: "text/csv" }));
+    fd.append("max_sep_arcsec", "1.5");
+    const resp = await fetch("/api/crossmatch", { method: "POST", body: fd });
+    const j = await resp.json();
+    if (!resp.ok) throw new Error(j.detail || resp.status);
+    xmShow("演示完成:C1/C2 为跨 0° 的同等最优匹配,C3/C4 源争用且未匹配也是同等最优,C5 唯一匹配", true);
+    renderCrossmatch(j);
+  } catch (e) {
+    xmShow("演示失败:" + e.message, false);
+  } finally { xmBusy = false; }
+});
 </script>
 </body>
 </html>
